@@ -1,0 +1,170 @@
+name: Sing-box FreeBSD Build & Upload Artifacts
+# 配置触发条件
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "master" branch
+  # Runs every 5 minutes.
+  # Runs at 00:00 UTC every day.
+  # Actions schedules run at most every 5 minutes.
+  # schedule:
+    # - cron: '*/5 * * * *'
+    # - cron: '0 0 * * *'
+  # 通过 push 触发
+  push:
+    tags:
+      - '*'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build-container-and-deploy:
+    runs-on: ubuntu-latest
+    name: Build Sing-box for FreeBSD
+    # 判断是否是 push tag 触发 release
+    if: github.event_name == 'push'
+    env:
+      GITHUB_TOKEN : ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REF_NAME : ${{ github.ref_name }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Test in FreeBSD
+      id: test
+      uses: vmactions/freebsd-vm@v1
+      with:
+          envs: 'GITHUB_TOKEN GITHUB_REF_NAME'
+          release: "14.1"
+          #arch: aarch64
+          usesh: true
+          prepare: |
+            pkg install -y curl wget gh go
+          run: |
+            # 函数：确保成功获取到网页内容
+            ensurePageContent() {
+                local PAGE_CONTENT=$1
+                if [ -z "${PAGE_CONTENT}" ]; then
+                    echo "无法获取网页内容，请稍后再试。"
+                    exit 1
+                fi
+            }
+
+            # 函数：尝试获取网页内容，最多重试5次
+            fetchPageContent() {
+                local GITHUB_URI=$1
+                local PAGE_CONTENT=""
+                for i in 1 2 3 4 5 ; do
+                    PAGE_CONTENT=$(curl -sL ${GITHUB_URI})
+                    if [ -n "${PAGE_CONTENT}" ]; then
+                        break
+                    fi
+                    echo "尝试获取网页内容失败，重试第 $i 次..."
+                    sleep 2
+                done
+                echo "${PAGE_CONTENT}"
+            }
+
+            # 下载 sing-box-freebsd sing-box-freebsd 配置并启用
+            downloadAndBuild() {
+                local URI=$1
+                local TARGET_OS=$2
+                local arch=$3
+                local GITHUB_URI="https://github.com/${URI}"
+                local TAG_URI="/${URI}/releases/tag/"
+                
+                echo '函数执行'
+                PAGE_CONTENT=$(fetchPageContent ${GITHUB_URI}/releases)
+                ensurePageContent "${PAGE_CONTENT}"
+            
+                # 提取最新版本号
+                VERSION=$(echo "${PAGE_CONTENT}" | grep -o "href=\"${TAG_URI}[^\"]*" | head -n 1 | sed "s;href=\"${TAG_URI};;" | sed 's/\"//g')
+                echo ${VERSION}
+            
+                # 下载并编译
+                FILENAME=$(basename ${GITHUB_URI})
+                FULL_URL=${GITHUB_URI}/archive/refs/tags/${VERSION}.tar.gz
+                echo "${FULL_URL}"
+                
+                # 确保下载链接存在
+                if [ -z "${FULL_URL}" ]; then
+                    echo "无法找到匹配的下载链接，请稍后再试。"
+                    exit 1
+                fi
+                
+                wget -t 3 -T 10 --verbose --show-progress=on --progress=bar --no-check-certificate --hsts-file=/tmp/wget-hsts -c "${FULL_URL}" -O ${FILENAME}.tar.gz
+                tar zxf ${FILENAME}.tar.gz
+                cd ${FILENAME}-${VERSION#v}
+                CGO_ENABLED=0 GOOS=$TARGET_OS GOARCH=$arch go build -tags with_gvisor,with_dhcp,with_wireguard,with_reality_server,with_clash_api,with_quic,with_utls,with_ech,with_tailscale -buildvcs=false ./cmd/${FILENAME}
+                mv -fv ./${FILENAME} /tmp/sing-box-"${TARGET_OS}"-"${arch}"
+                chmod -v u+x /tmp/sing-box-"${TARGET_OS}"-"${arch}"
+                echo "    sing-box-"${TARGET_OS}"-"${arch}": $(sha256sum /tmp/sing-box-"${TARGET_OS}"-"${arch}" | cut -d ' ' -f 1)" >> /tmp/release.txt
+                cd -
+                rm -frv ${FILENAME}.tar.gz ${FILENAME}-${VERSION#v}
+            }
+            # 设置 Git 配置，解决"detected dubious ownership"问题
+            git config --global --add safe.directory /home/runner/work/sing-box-freebsd/sing-box-freebsd
+
+            # 下载并安装 Go 1.24
+            wget -t 3 -T 5 --verbose --show-progress=on --progress=bar --no-check-certificate --hsts-file=/tmp/wget-hsts -c "https://go.dev/dl/go1.24.0.src.tar.gz" -O"go1.24.0.src.tar.gz"
+
+            tar fvxz go1.24.0.src.tar.gz
+            cd go/src
+            GOOS=$(uname -s | tr '[:upper:]' '[:lower:]') GOARCH=amd64 ./bootstrap.bash
+            #./make.bash
+
+            # 设置 Go 环境
+            # export PATH=$PATH:/path/to/go/bin
+            go version
+
+            # 安装额外go环境
+            #go install golang.org/dl/go1.24.0@latest
+            #go1.24.0 download
+            #go1.24.0 version
+            #go1.24.0 env GOROOT
+
+            # Disable FIPS module in go-boring
+            #export GOEXPERIMENT=noboringcrypto
+            #export CGO_ENABLED=0
+
+            echo "#### SHA256 Checksums:" > /tmp/release.txt
+
+            export TARGET_OS=freebsd
+            for arch in "386" "amd64" "arm" "arm64"; do
+                export TARGET_ARCH=$arch
+
+                echo "Building sing-box-${TARGET_OS}-${arch}"
+                
+                # 本地 go 构建 sing-box
+                downloadAndBuild "SagerNet/sing-box" "${TARGET_OS}" "${arch}"
+
+                echo "    sing-box-${TARGET_OS}-$arch: $(sha256sum /tmp/sing-box-${TARGET_OS}-$arch | cut -d ' ' -f 1)" >> /tmp/release.txt
+            done
+
+            export TARGET_OS=linux
+            for arch in "386" "amd64" "arm" "armhf" "arm64"; do
+                unset TARGET_ARM
+                export TARGET_ARCH=$arch
+
+                ## Support for arm platforms without hardware FPU enabled
+                if [ $arch == arm ] ; then
+                    export TARGET_ARCH=arm
+                    export TARGET_ARM=5
+                fi
+                
+                ## Support for armhf builds 
+                if [ $arch == armhf ] ; then
+                    export TARGET_ARCH=arm
+                    export TARGET_ARM=7
+                fi
+
+                echo "Building sing-box-${TARGET_OS}-${arch}"
+                
+                # 本地 go 构建 sing-box
+                downloadAndBuild "SagerNet/sing-box" "${TARGET_OS}" "${arch}"
+                echo "    sing-box-${TARGET_OS}-$arch: $(sha256sum /tmp/sing-box-${TARGET_OS}-$arch | cut -d ' ' -f 1)" >> /tmp/release.txt
+            done
+            
+            echo "Releasing built artifacts"
+            echo "$GITHUB_TOKEN" | gh auth login --with-token
+            gh release create $GITHUB_REF_NAME /tmp/sing-box-* --title "Release $GITHUB_REF_NAME" --notes-file /tmp/release.txt
+
+            echo "发布完成"
+
